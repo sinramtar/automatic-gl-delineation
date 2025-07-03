@@ -1,0 +1,80 @@
+Directories:
+  work_dir:                       <path to working directory>
+  full_res_dinsar:                dinsar_full_res                                             # relative path to full resolution DInSAR phases
+  downsampled_dinsar:             dinsar_3031_100
+  velocity:                       velocity                                                    # relative path to ice velocity tifs
+  cats:                           cats                                                        # relative path to CATS2008
+  air_pressure:                   air_pressure                                                # relative path to NCAR/NCEP surface level pressure
+  dem:                            dem                                                         # relative path to DEM
+  features_stack_npz:             features_stack_npz                                          # relative path to training, validation and test features stack (.npz files)
+  features_stack_tif:             features_stack_tif                                          # relative path to training, validation and test features stack (.tif files)
+  split:                          split.txt                                                   # text file containing the split of training, validation and test sets
+  labels_npz:                     labels_npz                                                  # GL patches corresponding to the features stack (.npz files)
+  labels_tif:                     labels_tif                                                  # GL raster patches corresponding to the features stack (.tif files)
+  labels_reference:               gls_100                                                     # GL raster patches corresponding to the downsampled DInSAR phases (.tif files)
+  nn_outputs:                     outputs_npz                                                 # relative path to directory where predictions from HED are saved
+  output_vectors:                 output_vectors                                              # relative path to directory where vectorized predicted GLs are saved
+
+  checkpoint:                     checkpoints                                                 # model checkpoints directory
+  logs_dir:                       dnn_logs                                                    # model training logs directory
+  
+  geom_dir:                       AIS_CCI_GLL_subset.geojson                                  # shapefile/GeoJSON of manually digitized GLs (used as labels for training the neural network)
+  reference_manual_GL:            measures                                                    # path to measures GLs, for filtering outliers
+  ensemble_dir:                   <dir to save ensemble predictions>
+
+
+Data:
+  pixel_size:                     [100.0, 100.0]                                              # pixel size of downsampled DInSAR phase
+  overlap:                        0.2                                                         # % overlap between tiles of features stack
+  tile_dimensions:                256                                                         # height and width of each tile. Always square
+  select_features:                [0, 1]                                                      # select features to be loaded by the data loader for the training, validation and test phases of the DNN. Refer to ml/prepare_torch_datasets.py script for description
+  augment_flipped:                True                                                        # apply random flips to features stack and corresponding GL patches which contain atleast one GL pixel
+  augment_empties:                False                                                       # apply random flips to features stack and corresponding GL patches which do not contain GL pixels
+  outlier_removal_threshold:      2000                                                        # creates a buffer of the specified distance (m) around a reference GL (e.g. AIS_cci, MeASuRES), removes ML generated GLs outside this buffer
+  bin_threshold:                  0.8                                                         # threshold value to binarize predictions
+  test_interferometric_only:      False
+
+Model_Details:
+  model:                          HED
+  name:                           HED_best_variant
+  predict:                        True                                                        # Set to False for training
+  tune:                           False
+  deterministic:                  True
+  resume_training:                False
+  epochs:                         100
+  batch_size:                     16
+  accumulate_batches:             1
+  save_top_k:                     1
+  seed:                           0
+  find_lr:                        False
+  divergence_threshold:           1.0e-03
+
+Loss:
+  loss:                           weighted_cross_entropy                                     # Loss functions: weighted_cross_entropy, focal, dice
+  gamma:                          2                                                          # gamma value for focal loss
+  dice_alpha:                     1
+  dice_beta:                      0.001
+  epsilon:                        1.0e-07                                                    # epsilon value to prevent division by zero
+  max_distance:                   2
+  weight_negatives:               1                                                          # weight for non GL pixels in weighted cross entropy calculation. Applies when class_balanced_weighting is False
+  weight_positives:               1                                                          # weight for GL pixels in weighted cross entropy calculation. Applies when class balanced_weighting is False
+  class_balanced_weighting:       True                                                       # follows the weighted cross entropy equation, as described by Xie & Tu, 2015
+  reduce_batch:                   mean                                                       # computes the mean of the losses for each training batch
+
+Optimizer:
+    optimizer:                    Adam
+    learning_rate:                1.0e-04
+    weight_decay:                 0
+
+Metrics:
+    threshold:                    0.5
+    thresholds:                   null
+
+HED:
+  filters:                        [64,128,256,512,512]                                       # num. filters for each conv. layer of HED
+  conv_kernel_size:               3
+  conv_kernel_strides:            1
+  pool_kernel_size:               2
+  pool_kernel_strides:            2
+  padding:                        same
+  activation:                     [relu,relu,relu,relu,relu]

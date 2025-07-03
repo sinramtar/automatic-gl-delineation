@@ -1,0 +1,143 @@
+import os
+import pathlib
+
+from prepare_features import (reproject_and_resample_complex, create_patches, to_npy, create_dataset_split, stack_features,
+                             get_global_range, scale_features, np)
+
+import rasterio as rio
+from tqdm import tqdm
+
+cwd = pathlib.Path(os.getcwd())
+
+configfile: cwd.parent / 'config.yaml' 
+
+config['Directories']['work_dir'] = pathlib.Path(config['Directories']['work_dir'])
+
+features = ['Real', 'Imaginary', 'Pseudocoherence', 'Phase', 'DEM', 'Ice velocity easting',
+            'Ice velocity northing', 'Differential tide', 'Air pressure']
+
+exclude = ['work_dir', 'features_stack_npz', 'features_stack_tif', 'full_res_dinsar', 'downsampled_dinsar']
+for key, value in config['Directories'].items():
+    if key not in exclude or value != None:
+        config['Directories'][key] = config['Directories']['work_dir'] / config['Directories'][key]
+
+config['Directories']['features_stack_npz'] = pathlib.Path(config['Directories']['features_stack_npz'])
+config['Directories']['features_stack_tif'] = pathlib.Path(config['Directories']['features_stack_tif'])
+config['Directories']['full_res_dinsar'] = pathlib.Path(config['Directories']['full_res_dinsar'])
+config['Directories']['downsampled_dinsar'] = pathlib.Path(config['Directories']['downsampled_dinsar'])
+
+config['Directories']['downsampled_dinsar'].mkdir(parents = True, exist_ok = True)
+
+
+full_res_interferograms = [interferogram.name for interferogram in config['Directories']['full_res_dinsar'].glob('*.tif')]
+
+rule all:
+    input:
+        config['Directories']['features_stack_npz'] / 'OK.all'
+
+rule downsample:
+    input:
+        config['Directories']['full_res_dinsar'] / "{raster}.tif"
+    output:
+        config['Directories']['downsampled_dinsar'] / "{raster}.tif"
+    run:
+        print(f'Downsampling full resolution interferograms...')
+        reproject_and_resample_complex(raster = pathlib.Path(input[0]), writedir = pathlib.Path(output[0]).parent, 
+                                       dst_crs = 'EPSG:3031', pixel_size = tuple(config['Data']['pixel_size']))
+
+checkpoint create_tiles:
+    input:
+        interferograms = expand(config['Directories']['downsampled_dinsar'].as_posix() + '/{raster}', raster = full_res_interferograms)
+    output:
+        directory(config['Directories']['features_stack_tif'].as_posix())
+    run:
+        config['Directories']['features_stack_tif'].mkdir(parents = True, exist_ok = True)
+
+        for interferogram in tqdm(input.interferograms):
+            create_patches(raster = pathlib.Path(interferogram), overlap = config['Data']['overlap'], 
+                           savepatches = config['Directories']['features_stack_tif'], patch_size = config['Data']['tile_dimensions'])
+            
+rule prepare_feature_stacks:
+    input:
+        config['Directories']['features_stack_tif'] / '{tile}.tif'
+    output:
+        config['Directories']['features_stack_npz'] / '{tile}.npz'
+    run:
+        features_tif = pathlib.Path(input[0])
+        stack_features(raster = features_tif, dem_raster = pathlib.Path(config['Directories']['dem']))
+
+        with rio.open(features_tif) as tif:
+            features = tif.read()
+            to_npy(arr = features, name = features_tif.name.removesuffix('.tif'), savedir = config['Directories']['features_stack_npz'], 
+                            dest_dim = config['Data']['tile_dimensions'])
+
+def aggregate_tiles(wildcards):
+    feature_tiles_dir = checkpoints.create_tiles.get(**wildcards).output[0]
+    feature_tiles_dir = pathlib.Path(feature_tiles_dir)
+
+    return expand(config['Directories']['features_stack_npz'].as_posix() + '/{tile}.npz', tile = glob_wildcards(feature_tiles_dir / '{tile}.tif').tile)
+
+rule split_dataset:
+    input:
+        aggregate_tiles
+    output:
+        config['Directories']['split'].as_posix(),
+        config['Directories']['features_stack_npz'] / 'features_in_stack.txt',
+        config['Directories']['features_stack_npz'] / 'OK.created_dataset_split'
+    run:
+        tif_tiles = list((config['Directories']['features_stack_tif']).glob('*.tif'))
+
+        with rio.open(tif_tiles[0]) as tif:
+            features_in_stack = tif.descriptions
+
+        with open(output[1], 'w') as out:
+            for description in features_in_stack:
+                band = [feature for feature in features if feature in description]
+                if len(band) == 1:
+                    out.write(band[0] + '\n')
+
+        create_dataset_split(tiles_npz = config['Directories']['features_stack_npz'], labels_npz = None, grounding_lines = None, split_file = config['Directories']['split'])
+
+        with open(output[2], 'w') as out:
+            out.write('Ok')
+        
+rule scale_features:
+    input:
+        config['Directories']['features_stack_npz'] / 'features_in_stack.txt',
+        config['Directories']['features_stack_npz'] / 'OK.created_dataset_split'
+    output:
+        config['Directories']['features_stack_npz'] / 'OK.scaled_features',
+        config['Directories']['features_stack_npz'] / 'OK.all'
+    run:
+        tiles = list(config['Directories']['features_stack_npz'].glob('*.npz'))
+
+        bands = []
+        ignore_values = []
+        with open(input[0]) as f:
+            features_in_stack = f.readlines()
+            features_in_stack = [feature.strip() for feature in features_in_stack]
+            if 'DEM' in features_in_stack:
+                bands.append(4)
+                ignore_values.append(-32767.0)
+            if 'Ice velocity easting' in features_in_stack:
+                bands.append(5)
+                ignore_values.append(3.4e38)
+            if 'Ice velocity northing' in features_in_stack:
+                bands.append(6)
+                ignore_values.append(3.4e38)
+            if 'Differential tide' in features_in_stack:
+                bands.append(7)
+                ignore_values.append(np.nan)
+
+        print(f'Bands: {bands}, ignore_values: {ignore_values}')
+        global_range = get_global_range(tiles = tiles, bands = bands, ignore_values = ignore_values)
+        
+        print(f'Global range: {global_range}')
+        for tile in tqdm(tiles):
+            scale_features(tile = tile, savedir = config['Directories']['features_stack_npz'], global_max_mins = global_range, bands = bands)
+        
+        with open(output[0], 'w') as out:
+            out.write('Ok')
+        
+        with open(output[1], 'w') as out:
+            out.write('Ok')

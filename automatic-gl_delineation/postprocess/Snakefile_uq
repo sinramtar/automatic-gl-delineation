@@ -1,0 +1,179 @@
+import os
+import pathlib
+
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import rasterio as rio
+from tqdm import tqdm
+
+from uq_methods import get_average_std_predictions, polygonize_uncertainties, measure_approx_stddev
+from vectorize import create_predictions_df_predict_only, merge_tiles, remove_outliers, threshold_predictions
+# from metrics import compute_polis_lines, compute_coverage, compute_dataset_metrics, compute_testset_f1_ap
+
+cwd = pathlib.Path(os.getcwd())
+
+configfile: cwd.parent / 'config.yaml'
+
+config['Directories']['work_dir'] = pathlib.Path(config['Directories']['work_dir'])
+
+exclude = ['work_dir', 'ensemble_dir', 'features_stack_npz', 'features_stack_tif', 'downsampled_dinsar']
+for key, value in config['Directories'].items():
+    if (key not in exclude) or (value != None):
+        config['Directories'][key] = config['Directories']['work_dir'] / config['Directories'][key]
+
+ensemble_results_raster_dir = (config['Directories']['nn_outputs'] / config['Directories']['ensemble_dir'].name).as_posix()
+ensemble_results_vector_dir = (config['Directories']['output_vectors'] / config['Directories']['ensemble_dir'].name).as_posix()
+
+config['Directories']['features_stack_npz'] = pathlib.Path(config['Directories']['features_stack_npz']).as_posix()
+config['Directories']['features_stack_tif'] = pathlib.Path(config['Directories']['features_stack_tif'])
+config['Directories']['downsampled_dinsar'] = pathlib.Path(config['Directories']['downsampled_dinsar'])
+
+with open(config['Directories']['split']) as split_info:
+    split = list(filter(None, (line.rstrip() for line in split_info)))
+
+train_tiles = split[1:split.index('train_empties')] 
+validation_tiles = split[split.index('validation_valids') + 1:split.index('validation_empties')]
+test_tiles = split[split.index('test_valids') + 1:split.index('test_empties')]
+
+if config['Data']['test_interferometric_only']:
+    test_interferometric = split[split.index('interferometric_valids') + 1:split.index('interferometric_empties')]
+    test_tiles = test_tiles + test_interferometric
+
+ensemble_models = [config['Directories']['nn_outputs'] / model for model in config['Model_Details']['ensemble']]
+    
+predictions = train_tiles + validation_tiles + test_tiles
+predictions = [tile.removesuffix('.npz') for tile in predictions if 'augmented_' not in tile]
+uuids = np.unique([tile[:tile.rfind('_tile')] for tile in predictions])
+
+pathlib.Path(ensemble_results_raster_dir).mkdir(exist_ok = True, parents = True)
+pathlib.Path(ensemble_results_vector_dir).mkdir(exist_ok = True, parents = True)
+
+rule all:
+    input:
+        ensemble_results_raster_dir + '/' + 'OK.stats',
+        expand(ensemble_results_raster_dir + '/' + '{raster}_stats.tif', raster = uuids),
+        ensemble_results_vector_dir + '/' + (config['Model_Details']['name'] + '_ensemble_mean.geojson'),
+        ensemble_results_vector_dir + '/' + (config['Model_Details']['name'] + '_ensemble_stddev_buffer.geojson'),
+        # ensemble_results_vector_dir + '/' + 'polis_distances.npy',
+        # ensemble_results_vector_dir + '/' + 'metrics.npy',
+        # ensemble_results_vector_dir + '/' + 'ml_metrics.npy'
+
+rule ensemble_mean_stddev:
+    input:
+        tiles = expand(config['Directories']['features_stack_npz'] + '/' + '{tile}.npz', tile = predictions)
+    output:
+        outfile = ensemble_results_raster_dir + '/' + 'OK.stats'
+    run:
+        for tile in tqdm(input.tiles):
+            tile_name = tile[tile.rfind('/')+1:]
+            ensemble_predictions = [list(model.glob('*val_loss*'))[0] / tile_name for model in ensemble_models]
+            mean, sigma = get_average_std_predictions(tiles = ensemble_predictions)
+            with rio.open(config['Directories']['features_stack_tif'] / (tile_name.removesuffix('.npz') + '.tif')) as tif:
+                meta = tif.meta.copy()
+                bounds = tif.bounds
+                transform = tif.transform
+                
+            meta.update({'count': 2})
+            with rio.open(ensemble_results_raster_dir + '/' + (tile_name.removesuffix('.npz') + '_stats.tif'), 'w', **meta) as dest:
+                dest.write_band(1, mean[:meta['height'], :meta['width']])
+                dest.write_band(2, sigma[:meta['height'], :meta['width']])
+
+            np.savez_compressed(ensemble_results_raster_dir + '/' + (tile_name.removesuffix('.npz') + '_mu.npz'), mean[:, :, np.newaxis])
+        with open(output.outfile, 'w') as out:
+            out.write('OK')
+
+rule merge_tiles:
+    input:
+        ensemble_results_raster_dir + '/' + 'OK.stats'
+    output:
+        merged_stats = ensemble_results_raster_dir + '/' + '{raster}_stats.tif',
+    run:
+        ref_raster = config['Directories']['downsampled_dinsar'] / (output.merged_stats[output.merged_stats.rfind('/') + 1:output.merged_stats.rfind('_')])
+        ensemble_results_dir = pathlib.Path(ensemble_results_raster_dir)
+        stats_tiles = list(ensemble_results_dir.glob(ref_raster.name + '*_stats.tif'))
+        descriptions = ['Mean', 'Stddev']
+        merge_tiles(to_be_merged = stats_tiles, savepath = output.merged_stats, descriptions = descriptions, delete_orig = True)
+
+rule vectorize_ensemble_mean:
+    input:
+        expand(ensemble_results_raster_dir + '/' + '{raster}_stats.tif', raster = uuids)
+    output:
+        ensemble_results_vector_dir + '/' + (config['Model_Details']['name'] + '_ensemble_mean.geojson')
+    run:
+        interferograms = [config['Directories']['ensemble_dir'] / (raster + '_stats.tif') for raster in uuids]
+        predictions_df = create_predictions_df_predict_only(interferograms = interferograms, tiles_dir = pathlib.Path(ensemble_results_raster_dir),
+                                                            tif_dir = config['Directories']['features_stack_tif'], opt_threshold = config['Data']['bin_threshold'])
+        
+        filtered_df = remove_outliers(predictions_df = predictions_df, reference = config['Directories']['reference_manual_GL'], distance_threshold = config['Data']['outlier_removal_threshold'])
+        filtered_df.to_file(output[0], driver = 'GeoJSON')
+        
+rule polygonize_stats:
+    input:
+        mean_gls = ensemble_results_vector_dir + '/' + (config['Model_Details']['name'] + '_ensemble_mean.geojson')
+    output:
+        ensemble_results_vector_dir + '/' + (config['Model_Details']['name'] + '_ensemble_stddev_buffer.geojson')
+    run:
+        ensemble_mean = gpd.read_file(input.mean_gls)
+        buffers = []
+        stats_dir = pathlib.Path(ensemble_results_raster_dir)
+        for uuid in tqdm(ensemble_mean.UUID.values):
+            raster = list(stats_dir.glob(uuid + '*_stats.tif'))[0]
+            with rio.open(raster) as tif:
+                stats = tif.read()
+            
+            mean_gl = ensemble_mean.loc[ensemble_mean.UUID == uuid]
+            thresholded_stats = threshold_predictions(stats[0, :, :] + stats[1, :, :], threshold = config['Data']['bin_threshold']) # mean + stddev
+            uncertainty_buffer = polygonize_uncertainties(thresholded_stats = thresholded_stats, ref_tif = raster, mean_gl = mean_gl)
+            buffers.append(uncertainty_buffer)
+        buffers_df = gpd.GeoDataFrame(geometry = buffers, crs = 'EPSG:3031')
+        buffers_df['UUID'] = ensemble_mean.UUID.values
+        buffers_df.to_file(output[0], driver = 'GeoJSON')
+
+# rule compute_metrics:
+#     input:
+#         ensemble_results_vector_dir + '/' + (config['Model_Details']['name'] + '_ensemble_mean.geojson'),
+#         ensemble_results_vector_dir + '/' + (config['Model_Details']['name'] + '_ensemble_stddev_buffer.geojson')
+#     output:
+#         ensemble_results_vector_dir + '/' + 'polis_distances.npy',
+#         ensemble_results_vector_dir + '/' + 'metrics.npy',
+#         ensemble_results_vector_dir + '/' + 'ml_metrics.npy'
+#     run:
+#         evaluation_df = gpd.read_file(config['Directories']['geom_dir'])
+#         ensemble_mean_df = gpd.read_file(input[0])
+#         stddev_df = gpd.read_file(input[1])
+        
+#         pred_to_gt, gt_to_pred, overall_deviations = compute_polis_lines(evaluation_df, ensemble_mean_df)
+#         per_sample_stddev = measure_approx_stddev(ensemble_mean_df = ensemble_mean_df, stddev_df = stddev_df)
+        
+#         line_metrics = pd.DataFrame(columns = ['pred_to_gt', 'gt_to_pred', 'deviations', 'dataset', 'UUID'])
+#         line_metrics['pred_to_gt'] = pred_to_gt
+#         line_metrics['gt_to_pred'] = gt_to_pred
+#         line_metrics['deviations'] = overall_deviations
+#         line_metrics['UUID'] = ensemble_mean_df.UUID.values
+        
+#         existing_data = evaluation_df.loc[evaluation_df.UUID.isin(ensemble_mean_df.UUID.values), ['UUID', 'dataset']]
+#         ensemble_mean_df = ensemble_mean_df.set_index('UUID')
+#         ensemble_mean_df = ensemble_mean_df.reindex(existing_data['UUID'])
+#         ensemble_mean_df = ensemble_mean_df.reset_index()
+#         line_metrics['dataset'] = existing_data.dataset.values
+#         line_metrics['stddev'] = per_sample_stddev
+
+#         line_metrics = compute_coverage(ground_truth = evaluation_df, prediction = ensemble_mean_df, line_metrics = line_metrics)
+#         np.save(output[0], line_metrics.to_dict())
+#         compute_dataset_metrics(df = line_metrics, savemetrics = pathlib.Path(output[1]))
+    
+#         buffers = np.linspace(100, 1000, 10)
+#         thresholds = np.linspace(0.1, 1, 10)
+        
+#         labels = []
+#         predictions = []
+#         for tile in test_tiles:
+#             with np.load(config['Directories']['labels_npz'] / tile) as data:
+#                 labels.append(data['arr_0'][:, :, 0])
+#             with np.load(ensemble_results_raster_dir + '/' + (tile.removesuffix('.npz') + '_mu.npz')) as data:
+#                 predictions.append(data['arr_0'][:, :, 0])
+                
+#         ap, f1 = compute_testset_f1_ap(predictions = predictions, labels = labels, thresholds = thresholds)
+
+#         np.save(pathlib.Path(output[-1]), {'ap': ap, 'ods_f1': f1})

@@ -1,0 +1,52 @@
+import os
+import pathlib
+import manager
+
+cwd = pathlib.Path(os.getcwd())
+
+configfile: cwd.parent / 'config.yaml'
+
+config['Directories']['work_dir'] = pathlib.Path(config['Directories']['work_dir'])
+
+exclude = ['features_stack_npz', 'features_stack_tif', 'full_res_dinsar', 'downsampled_dinsar', 'work_dir']
+for key, value in config['Directories'].items():
+    if (key not in exclude) and (value != None):
+        config['Directories'][key] = config['Directories']['work_dir'] / config['Directories'][key]
+
+config['Directories']['features_stack_npz'] = pathlib.Path(config['Directories']['features_stack_npz'])
+config['Directories']['features_stack_tif'] = pathlib.Path(config['Directories']['features_stack_tif'])
+config['Directories']['full_res_dinsar'] = pathlib.Path(config['Directories']['full_res_dinsar'])
+config['Directories']['downsampled_dinsar'] = pathlib.Path(config['Directories']['downsampled_dinsar'])
+
+rule train:
+    output:
+        directory((config['Directories']['checkpoint'] / config['Model_Details']['name']).as_posix())
+    run:
+        dnn_manager = manager.TorchModelManager(config)
+        dnn_manager.train()
+
+rule resume_training:
+    input:
+        model = config['Directories']['checkpoint'] / (config['Model_Details']['name'] + '.ckpt')
+    output:
+        config['Directories']['checkpoint'] / 'extended_training.txt'
+    run:
+        dnn_manager = manager.TorchModelManager(config)
+        dnn_manager.train()
+        with open(output[0], 'w') as line:
+            line.write('For snakemake to work, resume_training\n')
+
+model_checkpoints = [checkpoint.name.removesuffix('.ckpt') for checkpoint in (config['Directories']['checkpoint'] / config['Model_Details']['name']).glob('epoch*val_loss*')]
+
+rule predict:
+    input:
+        models = expand(config['Directories']['checkpoint'] / config['Model_Details']['name'] / ('{checkpoint}' + '.ckpt'), checkpoint = model_checkpoints)
+    output:
+        predictions = directory(expand(config['Directories']['nn_outputs'] / config['Model_Details']['name'] / '{checkpoint}', checkpoint = model_checkpoints))
+    run:
+        for model, savedir in zip(input.models, output.predictions): 
+            model = pathlib.Path(model)
+            savedir = pathlib.Path(savedir)
+            config['Model_Details']['name'] = model.parent.name + '/' + model.name.removesuffix('.ckpt')
+            dnn_manager = manager.TorchModelManager(config)
+            dnn_manager.predict(pretrained = model, savedir = savedir)

@@ -1,0 +1,45 @@
+import os
+import pathlib
+from tqdm import tqdm
+
+from vectorize import create_predictions_df_predict_only, remove_outliers
+
+cwd = pathlib.Path(os.getcwd())
+
+configfile: cwd.parent / 'config.yaml'
+
+config['Directories']['work_dir'] = pathlib.Path(config['Directories']['work_dir'])
+
+for key, value in config['Directories'].items():
+    if key != 'work_dir' or value != None:
+        config['Directories'][key] = config['Directories']['work_dir'] / config['Directories'][key]
+
+pathlib.Path(config['Directories']['output_vectors'] / config['Model_Details']['name']).mkdir(parents = True, exist_ok = True)
+model_checkpoints = [model.name for model in (config['Directories']['nn_outputs'] / config['Model_Details']['name']).glob('epoch*')]
+predictions_vector_dir = (config['Directories']['output_vectors'] / (config['Model_Details']['name'] + '/')).as_posix()
+
+with open(config['Directories']['split']) as split_info:
+    split = split_info.readlines()
+    split = [elem.strip() for elem in split]
+
+predictions_npz = split[split.index('test_valids') + 1:split.index('test_empties')]
+
+rule all:
+    input:
+        expand(predictions_vector_dir +  '/' + config['Model_Details']['name'] + '_{checkpoint}' + '.geojson', checkpoint = model_checkpoints),
+        expand(predictions_vector_dir + '/' + config['Model_Details']['name'] + '_{checkpoint}_filtered' + '.geojson', checkpoint = model_checkpoints)
+
+rule generate_predictions_df:
+    input:
+        config['Directories']['nn_outputs'] / (config['Model_Details']['name'] + '/{checkpoint}')
+    output:
+        predictions_vector_dir + '/' + config['Model_Details']['name'] + '_{checkpoint}' + '.geojson',
+        predictions_vector_dir + '/' + config['Model_Details']['name'] + '_{checkpoint}_filtered' + '.geojson'
+    run:
+        tiles_dir = pathlib.Path(input[0])
+        predictions_df = create_predictions_df_predict_only(interferograms = list(config['Directories']['downsampled_dinsar'].glob('*.tif')), tiles_dir = tiles_dir, tif_dir = config['Directories']['features_stack_tif'], opt_threshold = config['Data']['bin_threshold'])
+        # Filter predictions, using measures as reference
+        filtered_df = remove_outliers(predictions_df = predictions_df, reference = config['Directories']['reference_manual_GL'], distance_threshold = config['Data']['outlier_removal_threshold'])
+        
+        predictions_df.to_file(output[0], driver = 'GeoJSON')
+        filtered_df.to_file(output[1], driver = 'GeoJSON')
